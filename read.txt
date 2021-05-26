@@ -1,0 +1,65 @@
+基于容器原理(docker、lxc、cells)的Android 双系统设计概要
+
+pppaass 2020-12-21 18:17:59  8368  收藏 16
+分类专栏： Android
+版权
+写在前面
+
+前几年预研加开发android双系统，中途用过不少开源代码或者研读过大牛BLOG，现开放双系统设计原理来回报社区。
+
+android容器技术已在android 6 7 8 9 10版本中分别实现并应用。
+
+原型来自于哥伦比亚大学虚拟化实验室的一篇论文(也有一个DEMO)，后来一个以色列公司cellrox在2014年进行了商业化，2015年的时候浙大一个操作系统实验室也出了一个DEMO(名称叫Condroid)。
+哥大论文地址：http://systems.cs.columbia.edu/projects/cells/
+浙大项目地址：http://condroid.github.io/
+以色列公司官网：http://www.cellrox.com/
+浙大项目本来有源码，由于一些原因目前只剩下文档，对android源码比较熟悉能复原程序。
+
+原理：
+同docker、lxc、cells原理一致，利用kernel中的namespace+cgroup来实现android容器系统。
+
+容器启动：
+要有一个能启动init进程的容器管理进程，该进程是rc service服务进程(celld)，负责启动、关闭和切换容器，管理和分配容器需要的系统资源。
+
+文件系统：
+容器的文件系统是在celld中构建，用到chroot、mount、mnt namespace等技术，android系统每个分区挂载实现机制如下：
+1、根分区挂载:在主系统的data分区目录中mount rootfs文件系统，当做容器系统的根分区。
+2、system分区挂载:将主系统的system目录mount(bind)成容器系统的system分区。
+3、data分区挂载:在主系统中创建一个临时目录，然后把这个临时目录mount成容器系统的data分区。
+4、sdcard挂载:原理同data分区挂载机制一致，android 6以后sdcard实现机制一直在变，这里需要注意一下是否需要变更。
+5、根分区的所有文件需要主动创建或者复制，system分区则不需要。
+
+
+
+init进程：
+在celld中主动启动init进程，当做容器系统的init根进程，在celld源码中有如下大致步骤：
+1、利用clone系统调用启动容器系统的init进程。
+2、clone系统调用需要一系列namespace标记来创建属于容器系统的命名空间。
+3、然后需要给这个init进程分配cgroup资源。
+4、最后需要调用chroot函数给容器系统分配根目录，实际上它是主系统中的一个目录而已。
+
+
+
+binder设备的虚拟化：
+这个驱动是android系统的核心，第一步一定要把它实现好，因为所有的android service都会注册到binder驱动中，容器系统的android service同样会注册到binder驱动中的，那么问题来了，相同的实名binder服务名只能注册一次，容器系统注册相同名称的binder服务会产生冲突。binder驱动是一个字符设备，所以binder驱动虚拟化就是重新构造binder的数据结构，让容器系统能在binder驱动中有其独立的数据结构,这个驱动的源码，在哥大的DEMO中是有的，有兴趣的可以参考。此外binder驱动的虚拟化还要实现一个很重要的功能，就是容器之间能互相访问对方的android service，这样后续很多设备的虚拟化就可以在此基础上实现。
+
+display虚拟化：
+显示的虚拟化要利用容器系统间能互相访问service才能实现，主系统运行surfaceflinger，容器系统不运行surfaceflinger，而是通过binder驱动访问主系统的surfaceflinger，当然surfaceflinger的代码也得调整，让主系统和容器系统的surface互相不干涉。这个驱动的虚拟化，在哥大的demo中也有实现，不过哥大的demo是在android4.4的基础上实现的，当时android源码中还没有ion这个驱动，android5.0以后有了ion这个驱动以后，哥大的display虚拟化方式是无效的，有兴趣的可以看一看，它在内核中实现，简单过程如下：
+1、display虚拟化的重点在于，非当前系统也需要实时更新画面，不能简单粗暴的进行阻截，只是这个非当前系统的画面要隐藏起来，不能投射到屏幕中。
+2、当非当前系统使用mmap映射显存时需要映射的是内存，将所有像素数据保存在内存中。
+3、当发生系统切换时，就可以将内存中的像素数据复制到显存当中。
+
+input虚拟化：
+触摸屏的虚拟化，哥大的demo也有，非常精良可以看看，主要思路就是：阻截非当前系统的event事件上报，同时需要注意系统切换时容易造成“留点”问题。
+
+网络的虚拟化：
+网络的虚拟化有两块，一个是wifi的，另一个则是数据流量的，但是二者实现原理都是一样的，有三种虚拟化方式：
+1、容器系统不隔离网络namespace，所有容器系统和主系统共享七层网络，但会有很多问题需要解决，同时也不太安全，或者叫不太敢用，如local socket 不能同名、netlink socket ID不能相同等。
+2、网络设备运行在主系统中，利用veth网络设备联通容器系统和主系统，而在第三层网络中实现路由转发，这种方式与android原框架融合性比较好。
+3、网络设备运行在主系统中，利用veth网络设备联通容器系统和主系统，而在第二层网络中实现桥接，这种方式不适合wlan，因为wifi只有p2p模式和热点模式，不能进行桥接，数据流量是可以的。
+
+
+好了，到此一个运行于手机中的容器android基本就能跑起来了，其实只要实现binder的虚拟化和display的虚拟化就能跑起来了！
+————————————————
+版权声明：本文为CSDN博主「pppaass」的原创文章，遵循CC 4.0 BY-SA版权协议，转载请附上原文出处链接及本声明。
+原文链接：https://blog.csdn.net/pppaass/article/details/76602419
